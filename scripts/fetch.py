@@ -173,6 +173,10 @@ def _diagnose_screener_page():
             "has_just_a_moment": "Just a moment" in text,
             "has_cf_challenge": ("cf-chl" in text
                                  or "challenge-platform" in text),
+            "table_tag_count": text.count("<table"),
+            "has_next_data_script": "__NEXT_DATA__" in text,
+            "mentions_AAPL": "AAPL" in text,
+            "mentions_MSFT": "MSFT" in text,
         })
     except Exception as exc:  # noqa: BLE001
         diag["error"] = f"{type(exc).__name__}: {exc}"
@@ -223,6 +227,14 @@ def fetch_screener():
                 if info["block_assessment"] == \
                         "no_evidence_of_ip_block_403_or_rate_limit_in_error_text":
                     info["block_assessment"] = "looks_like_ip_block_or_403"
+            elif (diag.get("status_code") == 200
+                    and not diag.get("has_screener_table")):
+                info["block_assessment"] = (
+                    "not_an_ip_block__finviz_screener_page_redesign: "
+                    "HTTP 200 with no Cloudflare challenge, but the live "
+                    "screener page (redirected to /screener/stocks) contains "
+                    "neither the screener_table markup nor the #pageSelect "
+                    "element that finvizfinance 1.5.0 parses")
             elif diag.get("has_screener_table"):
                 info["block_assessment"] = (
                     "no_evidence_of_ip_block_403_or_rate_limit_in_error_text"
