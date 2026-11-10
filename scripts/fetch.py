@@ -129,27 +129,114 @@ def fetch_fundamentals(ticker):
         return info, None
 
 
+def _run_overview(overview_cls, filters):
+    """One Overview screener fetch; returns the DataFrame or None.
+
+    finvizfinance's Base.screener_view() returns None (logging
+    'No ticker found.') when the response page has no #pageSelect
+    element -- it does not raise. Callers must handle None explicitly.
+    """
+    screener = overview_cls()
+    if filters:
+        try:
+            screener.set_filter(filters_dict=filters)
+        except TypeError:
+            screener.set_filter(filters)
+    try:
+        return screener.screener_view(order="Ticker", verbose=0)
+    except TypeError:
+        return screener.screener_view()
+
+
+def _diagnose_screener_page():
+    """Raw-page diagnostics for the filtered screener URL.
+
+    Uses finvizfinance's own public fetch() so the request goes through
+    the same transport (session, headers, wall detection) as the library.
+    Records only markers, never the full HTML.
+    """
+    diag = {"attempted": True}
+    try:
+        import re
+        from finvizfinance.util import fetch
+        resp = fetch("https://finviz.com/screener.ashx",
+                     params={"v": 111, "f": "idx_sp500", "o": "ticker"})
+        text = resp.text or ""
+        title = re.search(r"<title>(.*?)</title>", text, re.S)
+        diag.update({
+            "status_code": resp.status_code,
+            "final_url": str(resp.url),
+            "html_bytes": len(text),
+            "title": (title.group(1).strip()[:200] if title else None),
+            "has_pageSelect_element": 'id="pageSelect"' in text,
+            "has_screener_table": "screener_table" in text,
+            "has_just_a_moment": "Just a moment" in text,
+            "has_cf_challenge": ("cf-chl" in text
+                                 or "challenge-platform" in text),
+        })
+    except Exception as exc:  # noqa: BLE001
+        diag["error"] = f"{type(exc).__name__}: {exc}"
+    return diag
+
+
 def fetch_screener():
-    """Part (b): one Overview screener fetch (S&P 500)."""
+    """Part (b): one Overview screener fetch (S&P 500, default fallback)."""
     info = {"status": None, "filter": {"Index": "S&P 500"},
             "rows_returned": 0, "rows_saved": 0, "file": None,
-            "columns": [], "error": None,
+            "columns": [], "error": None, "attempts": [],
             "block_assessment": "not_applicable_no_error"}
     try:
         overview_cls = load_overview_class()
-        screener = overview_cls()
+        df = None
+        used_filter = {"Index": "S&P 500"}
         try:
-            screener.set_filter(filters_dict={"Index": "S&P 500"})
-        except TypeError:
-            screener.set_filter({"Index": "S&P 500"})
-        try:
-            df = screener.screener_view(order="Ticker", verbose=0)
-        except TypeError:
-            df = screener.screener_view()
+            df = _run_overview(overview_cls, used_filter)
+            info["attempts"].append(
+                {"filter": used_filter,
+                 "result": "dataframe" if df is not None else "returned_None"})
+        except Exception as exc:  # noqa: BLE001
+            info["attempts"].append(
+                {"filter": used_filter,
+                 "result": f"raised {type(exc).__name__}: {exc}"})
+            raise
+        if df is None:
+            # Task-sanctioned alternative: a default Overview screener fetch.
+            df = _run_overview(overview_cls, None)
+            info["attempts"].append(
+                {"filter": None,
+                 "result": "dataframe" if df is not None else "returned_None"})
+            if df is not None:
+                used_filter = None
+        if df is None:
+            diag = _diagnose_screener_page()
+            info["diagnostics"] = diag
+            err = ("screener_view returned None for both the filtered "
+                   "(Index='S&P 500') and the default Overview fetch. "
+                   "finvizfinance returns None when the response page has "
+                   "no #pageSelect element (library logs 'No ticker found.'). "
+                   f"Raw-page diagnostics: {json.dumps(diag)[:600]}")
+            info["error"] = err
+            evidence = err + " " + json.dumps(diag)
+            if (diag.get("has_just_a_moment") or diag.get("has_cf_challenge")
+                    or diag.get("status_code") in (403, 429, 503)):
+                info["block_assessment"] = block_assessment(evidence)
+                if info["block_assessment"] == \
+                        "no_evidence_of_ip_block_403_or_rate_limit_in_error_text":
+                    info["block_assessment"] = "looks_like_ip_block_or_403"
+            elif diag.get("has_screener_table"):
+                info["block_assessment"] = (
+                    "no_evidence_of_ip_block_403_or_rate_limit_in_error_text"
+                    " (screener table WAS present in raw HTML; the library's"
+                    " #pageSelect pagination check failed instead)")
+            else:
+                info["block_assessment"] = block_assessment(evidence)
+            info["status"] = "error"
+            return info
         total = int(df.shape[0])
         fname = os.path.join(RESULTS_DIR, "screener_overview.csv")
         df.head(20).to_csv(fname, index=False)
-        info.update({"status": "ok", "rows_returned": total,
+        info.update({"status": "ok", "filter": used_filter,
+                     "rows_returned": total,
                      "rows_saved": int(min(20, total)), "file": fname,
                      "columns": [str(c) for c in df.columns]})
         return info
